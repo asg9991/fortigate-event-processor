@@ -1,0 +1,12 @@
+log_file: /var/log/fortigate/fortigate.log
+
+zabbix:
+  server: 127.0.0.1
+  host: FortiGate Event Processor
+  key: fortigate.event
+
+classification_file: /opt/fortigate-event-processor/config/classification.csv
+
+state_file: /opt/fortigate-event-processor/state/thresholds.json
+
+log_directory: /opt/fortigate-event-processor/logs
