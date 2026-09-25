@@ -2,15 +2,29 @@
 
 import json
 import logging
+import os
 import re
+import signal
 import subprocess
+import sys
+import time
 import yaml
 
 from classifier import Classifier
 from notifier import Notifier
 from thresholds import ThresholdManager
 
+BASE_DIR = "/opt/fortigate-event-processor"
+
 FIELD_RE = re.compile(r'(\w+)=(".*?"|\S+)')
+
+# Run cleanup every N lines processed
+CLEANUP_INTERVAL = 500
+
+# Seconds to wait before restarting tail after failure
+TAIL_RESTART_DELAY = 5
+
+logger = logging.getLogger("fortigate")
 
 
 def parse(line):
@@ -28,86 +42,155 @@ def parse(line):
     }
 
 
-with open("/opt/fortigate-event-processor/config/parser.yaml") as f:
-    cfg = yaml.safe_load(f)
+def start_tail(log_file):
+    """Start tail -F on the given log file. Returns the Popen object."""
+    return subprocess.Popen(
+        ["tail", "-F", log_file],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True
+    )
 
-logging.basicConfig(
-    filename="/opt/fortigate-event-processor/logs/parser.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
 
-logging.info("FortiGate Event Processor started")
-logging.info(f"Monitoring {cfg['log_file']}")
+def load_config():
+    config_path = os.path.join(BASE_DIR, "config/parser.yaml")
+    with open(config_path) as f:
+        return yaml.safe_load(f)
 
-classifier = Classifier(cfg["classification_file"])
 
-thresholds = ThresholdManager(cfg["state_file"])
+def setup_logging(log_directory):
+    log_path = os.path.join(log_directory, "parser.log")
+    logging.basicConfig(
+        filename=log_path,
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s"
+    )
 
-notifier = Notifier(
-    cfg["zabbix"]["server"],
-    cfg["zabbix"]["host"],
-    cfg["zabbix"]["key"]
-)
 
-tail = subprocess.Popen(
-    ["tail", "-F", cfg["log_file"]],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.DEVNULL,
-    text=True
-)
+def main():
+    cfg = load_config()
+    setup_logging(cfg["log_directory"])
 
-for line in tail.stdout:
+    shutdown_requested = False
 
-    event = parse(line)
+    def handle_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        sig_name = signal.Signals(signum).name
+        logger.info(f"Received {sig_name}, shutting down...")
+        shutdown_requested = True
 
-    if not event["logid"]:
-        continue
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
 
-    rule = classifier.classify(event["logid"])
+    logger.info("FortiGate Event Processor started")
+    logger.info(f"Monitoring {cfg['log_file']}")
 
-    if not rule["enabled"]:
-        continue
+    classifier = Classifier(cfg["classification_file"])
+    thresholds = ThresholdManager(cfg["state_file"])
 
-    classification = rule["classification"]
+    notifier = Notifier(
+        cfg["zabbix"]["server"],
+        cfg["zabbix"]["host"],
+        cfg["zabbix"]["key"]
+    )
 
-    if classification == "IGNORE":
-        continue
+    tail = start_tail(cfg["log_file"])
+    lines_since_cleanup = 0
 
-    payload = {
-        "classification": classification,
-        "logid": event["logid"],
-        "level": event["level"],
-        "type": event["type"],
-        "subtype": event["subtype"],
-        "action": event["action"],
-        "message": event["msg"]
-    }
+    logger.info(f"Tail process started (pid={tail.pid})")
 
-    thresholds.cleanup()
+    try:
+        while not shutdown_requested:
 
-    if classification == "THRESHOLD":
+            # Check if tail is still alive
+            ret = tail.poll()
+            if ret is not None:
+                logger.warning(
+                    f"Tail process died (rc={ret}), "
+                    f"restarting in {TAIL_RESTART_DELAY}s..."
+                )
+                time.sleep(TAIL_RESTART_DELAY)
+                if shutdown_requested:
+                    break
+                tail = start_tail(cfg["log_file"])
+                logger.info(f"Tail restarted (pid={tail.pid})")
+                continue
 
-        send = thresholds.increment(
-            event["logid"],
-            rule["count"],
-            rule["window"]
-        )
+            # Non-blocking read with timeout
+            line = tail.stdout.readline()
 
-        if send:
-            logging.info(
-                f"THRESHOLD reached logid={event['logid']} "
-                f"count={rule['count']} window={rule['window']}"
-            )
+            if line == "":
+                # EOF — tail exited or no data yet
+                time.sleep(0.1)
+                continue
 
-            notifier.send(json.dumps(payload, ensure_ascii=False))
+            event = parse(line)
 
-    else:
+            if not event["logid"]:
+                continue
 
-        logging.info(
-            f"{classification} sent "
-            f"logid={event['logid']} "
-            f"level={event['level']}"
-        )
+            rule = classifier.classify(event["logid"])
 
-        notifier.send(json.dumps(payload, ensure_ascii=False))
+            if not rule["enabled"]:
+                continue
+
+            classification = rule["classification"]
+
+            if classification == "IGNORE":
+                continue
+
+            payload = {
+                "classification": classification,
+                "logid": event["logid"],
+                "level": event["level"],
+                "type": event["type"],
+                "subtype": event["subtype"],
+                "action": event["action"],
+                "message": event["msg"]
+            }
+
+            if classification == "THRESHOLD":
+
+                send = thresholds.increment(
+                    event["logid"],
+                    rule["count"],
+                    rule["window"]
+                )
+
+                if send:
+                    logger.info(
+                        f"THRESHOLD reached logid={event['logid']} "
+                        f"count={rule['count']} window={rule['window']}"
+                    )
+
+                    notifier.send(json.dumps(payload, ensure_ascii=False))
+
+            else:
+
+                logger.info(
+                    f"{classification} sent "
+                    f"logid={event['logid']} "
+                    f"level={event['level']}"
+                )
+
+                notifier.send(json.dumps(payload, ensure_ascii=False))
+
+            # Periodic cleanup
+            lines_since_cleanup += 1
+            if lines_since_cleanup >= CLEANUP_INTERVAL:
+                thresholds.cleanup()
+                lines_since_cleanup = 0
+
+    finally:
+        logger.info("Shutting down...")
+        if tail.poll() is None:
+            tail.terminate()
+            try:
+                tail.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                tail.kill()
+        logger.info("FortiGate Event Processor stopped")
+
+
+if __name__ == "__main__":
+    main()

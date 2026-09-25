@@ -1,0 +1,12 @@
+/opt/fortigate-event-processor/logs/parser.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    dateext
+    dateformat -%Y%m%d
+    create 0644 root root
+    copytruncate
+}
