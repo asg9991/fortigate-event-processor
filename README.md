@@ -340,6 +340,102 @@ En condiciones normales no es necesario modificar el código fuente.
 
 ---
 
+# Despliegue en servidor de producción
+
+Esta sección describe la instalación en el servidor que recibe el syslog del FortiGate y reenvía los eventos a Zabbix.
+
+## Requisitos del servidor
+
+* Python 3 con módulo `yaml` (`pip install pyyaml`)
+* rsyslog (recepción UDP 514)
+* logrotate
+* `zabbix_sender` en PATH, versión compatible con el servidor Zabbix
+* Acceso al servidor Zabbix (puerto 10051, protocolo trapper)
+
+## Estructura de instalación
+
+El código se instala en `/opt/fortigate-event-processor/`:
+
+```
+├── classifier.py
+├── fortigate_parser.py
+├── notifier.py
+├── thresholds.py
+├── config/
+│   ├── parser.yaml
+│   └── classification.csv
+├── state/          # creado en tiempo de ejecución (ignorado por git)
+└── logs/           # creado en tiempo de ejecución (ignorado por git)
+```
+
+`state/` y `logs/` se crean al arrancar y no se versionan.
+
+## rsyslog (recepción Syslog)
+
+Agregar `/etc/rsyslog.d/30-fortigate.conf`:
+
+```
+module(load="imudp")
+input(type="imudp" port="514")
+
+template(name="FortiGateRaw" type="string" string="%msg%\n")
+
+if $syslogfacility-text == 'local7' then {
+    action(type="omfile" file="/var/log/fortigate/fortigate.log" template="FortiGateRaw")
+    stop
+}
+```
+
+Crear `/var/log/fortigate` con propietario `syslog:adm` y modo `0750`, luego reiniciar rsyslog. El parser hace `tail -F` sobre `/var/log/fortigate/fortigate.log`.
+
+## systemd
+
+Crear `/etc/systemd/system/fortigate-event-processor.service`:
+
+```
+[Unit]
+Description=FortiGate Event Processor
+After=network-online.target rsyslog.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/fortigate-event-processor
+ExecStart=/usr/bin/python3 /opt/fortigate-event-processor/fortigate_parser.py
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Luego:
+
+```
+systemctl daemon-reload
+systemctl enable --now fortigate-event-processor
+```
+
+## logrotate
+
+Copiar `config/logrotate-parser` a `/etc/logrotate.d/fortigate-event-processor` para rotar `logs/parser.log`. Para `/var/log/fortigate/fortigate.log` usar rotación con `copytruncate`, ya que rsyslog lo mantiene abierto.
+
+## Verificación
+
+```
+systemctl status fortigate-event-processor rsyslog
+ss -lunp | grep :514
+tail -f /opt/fortigate-event-processor/logs/parser.log
+```
+
+## Notas
+
+* `fortigate_parser.py` usa rutas absolutas hardcodeadas bajo `/opt/fortigate-event-processor`. No ejecutar directamente desde el repo sin ajustar `BASE_DIR`.
+* El módulo no tiene `if __name__ == "__main__"`: importarlo arranca el bucle de eventos.
+* `classification.csv` acepta nuevos LogID sin modificar el código fuente.
+
 # Licencia
 
 Actualmente este proyecto se desarrolla para uso interno y podrá adaptarse para futuras implementaciones según las necesidades de cada cliente.
